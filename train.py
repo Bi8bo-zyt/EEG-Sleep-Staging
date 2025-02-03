@@ -4,7 +4,7 @@ import numpy as np
 from sklearn.model_selection import KFold
 from data_loaders import *
 import models.loss as module_loss
-import model.metric as module_metric
+import models.metric as module_metric
 import models.model as module_arch
 from parse_config import ConfigParser
 from trainer import Trainer
