@@ -2,7 +2,7 @@ import argparse
 import collections
 import numpy as np
 from sklearn.model_selection import KFold
-from data_loader.data_loaders import *
+from data_loaders import *
 import model.loss as module_loss
 import model.metric as module_metric
 import model.model as module_arch
