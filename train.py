@@ -3,9 +3,9 @@ import collections
 import numpy as np
 from sklearn.model_selection import KFold
 from data_loaders import *
-import model.loss as module_loss
+import models.loss as module_loss
 import model.metric as module_metric
-import model.model as module_arch
+import models.model as module_arch
 from parse_config import ConfigParser
 from trainer import Trainer
 from utils.util import *
