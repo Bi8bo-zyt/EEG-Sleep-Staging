@@ -49,7 +49,11 @@ class EnhancedSleepDataset(Dataset):
                 x = data['x']
                 y = data['y']
 
-                # 数据清洗：移除NaN值
+                # 新增维度调整代码
+                if x.ndim == 3 and x.shape[-1] == 1:
+                    x = x.squeeze(axis=-1)  # 移除冗余的通道维度 (N, 3000, 1) → (N, 3000)
+
+                # 数据清洗（保持原有）
                 valid_idx = ~np.isnan(x).any(axis=1)
                 x = x[valid_idx]
                 y = y[valid_idx]

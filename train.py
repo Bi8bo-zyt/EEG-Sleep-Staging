@@ -5,7 +5,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 from sklearn.model_selection import KFold, StratifiedKFold
 from models.model import AttnSleep_Improved  # 导入你改进后的模型
-from data_loaders import LoadDataset_from_numpy
+from data_loaders import EnhancedSleepDataset
 import time
 import json
 import copy
@@ -47,17 +47,25 @@ def load_data_files(data_path):
 class Trainer:
     def __init__(self, config, train_files, val_files):
         self.config = config
-        self.train_dataset = LoadDataset_from_numpy(train_files)
-        self.val_dataset = LoadDataset_from_numpy(val_files)
+        self.train_dataset = EnhancedSleepDataset(
+            train_files,
+            mode='train',
+            augment_prob=0.5  # 按需调整增强概率
+        )
+        self.val_dataset = EnhancedSleepDataset(
+            val_files,
+            mode='val'
+        )
 
         # 计算类别权重
-        all_labels = np.concatenate([np.load(f)["y"] for f in train_files])
+        all_labels = np.concatenate([self.train_dataset.y_data.numpy()])
         class_counts = np.bincount(all_labels)
         class_weights = 1. / class_counts
         class_weights = torch.tensor(class_weights, dtype=torch.float32).to(config.device)
 
         self.model = AttnSleep_Improved().to(config.device)
         self.criterion = nn.CrossEntropyLoss(weight=class_weights)
+
         self.optimizer = torch.optim.AdamW(self.model.parameters(),
                                            lr=config.lr,
                                            weight_decay=config.weight_decay)
@@ -200,7 +208,7 @@ def nested_cross_validation(config):
         final_model.model.load_state_dict(best_inner_model)
 
         # 在外层测试集上评估
-        test_loader = DataLoader(LoadDataset_from_numpy(outer_test_files),
+        test_loader = DataLoader(outer_test_files,
                                  batch_size=config.batch_size,
                                  shuffle=False)
         test_loss, test_acc = final_model.evaluate(test_loader)
