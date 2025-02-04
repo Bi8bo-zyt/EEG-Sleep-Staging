@@ -44,13 +44,16 @@ class SEBasicBlock(nn.Module):
 
     def forward(self, x):
         residual = x
+
         out = F.relu(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
         out = self.cbam(out)
+
         if self.downsample is not None:
             residual = self.downsample(x)
-        return F.relu(out + residual)
 
+        out += residual
+        return F.relu(out)
 
 # ---------------------- 改进模块2：深度监督机制 ----------------------
 class DeepSupervisionHead(nn.Module):
@@ -71,6 +74,7 @@ class MRCNN(nn.Module):
     def __init__(self, afr_reduced_cnn_size):
         super(MRCNN, self).__init__()
         drate = 0.5
+
         self.features1 = nn.Sequential(
             nn.Conv1d(1, 64, kernel_size=50, stride=6, padding=25, bias=False),
             nn.BatchNorm1d(64),
@@ -91,25 +95,43 @@ class MRCNN(nn.Module):
             nn.MaxPool1d(2, 2, padding=1)
         )
 
-        self.AFR = nn.Sequential(
-            nn.Dropout(0.3),
-            self._make_layer(SEBasicBlock, 256, afr_reduced_cnn_size, stride=1)
+        # 通道调整层
+        self.channel_adjust = nn.Sequential(
+            nn.Conv1d(256, afr_reduced_cnn_size, kernel_size=1),
+            nn.BatchNorm1d(afr_reduced_cnn_size),
+            nn.GELU()
         )
+
+        # 自适应融合模块
+        self.AFR = self._make_layer(SEBasicBlock, afr_reduced_cnn_size, afr_reduced_cnn_size, stride=1)
 
     def _make_layer(self, block, inplanes, planes, stride):
         downsample = None
         if stride != 1 or inplanes != planes:
             downsample = nn.Sequential(
-                nn.Conv1d(inplanes, planes, 1, stride, bias=False),
+                nn.Conv1d(inplanes, planes, kernel_size=1, stride=stride, bias=False),
                 nn.BatchNorm1d(planes)
             )
         return block(inplanes, planes, stride, downsample)
 
     def forward(self, x):
-        x1 = self.features1(x)
-        x2 = self.features2(x)
-        x = torch.cat([x1, x2], dim=2)
-        return self.AFR(x)
+        x1 = self.features1(x)  # [B, 128, L1]
+        x2 = self.features2(x)  # [B, 128, L2]
+
+        # 统一序列长度
+        max_len = max(x1.size(2), x2.size(2))
+        x1 = F.pad(x1, (0, max_len - x1.size(2)))
+        x2 = F.pad(x2, (0, max_len - x2.size(2)))
+
+        # 合并特征
+        x_concat = torch.cat([x1, x2], dim=1)  # [B, 256, L]
+
+        # 通道调整
+        x_concat = self.channel_adjust(x_concat)  # [B, afr_size, L]
+
+        # 特征融合
+        x_concat = self.AFR(x_concat)
+        return x_concat
 
 
 # ---------------------- 改进模块3：增强的Transformer ----------------------
@@ -181,6 +203,12 @@ class AttnSleep(nn.Module):
         )
 
     def forward(self, x):
+        # 调整输入维度顺序
+        if x.dim() == 3 and x.size(2) == 1:  # 输入形状为 [batch, seq_len, 1]
+            x = x.permute(0, 2, 1)  # 转换为 [batch, 1, seq_len]
+        elif x.dim() == 2:  # 输入形状为 [batch, seq_len]
+            x = x.unsqueeze(1)  # 转换为 [batch, 1, seq_len]
+
         # 特征提取
         x = self.mrcnn(x)
 
