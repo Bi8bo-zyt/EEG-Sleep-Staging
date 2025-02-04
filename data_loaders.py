@@ -35,11 +35,14 @@ class EnhancedSleepDataset(Dataset):
         self.x_data = torch.FloatTensor(self.x_data)
         self.y_data = torch.LongTensor(self.y_data)
 
-        # 调整维度 (batch, channel, seq_len)
-        if len(self.x_data.shape) == 2:
-            self.x_data = self.x_data.unsqueeze(1)
-        elif self.x_data.shape[1] != 1:
-            self.x_data = self.x_data.permute(0, 2, 1)
+        # 新增维度统一处理逻辑
+        if self.x_data.dim() == 2:
+            self.x_data = self.x_data.unsqueeze(1)  # (N, 3000) → (N, 1, 3000)
+        elif self.x_data.dim() == 3:
+            if self.x_data.shape[1] != 1:
+                self.x_data = self.x_data.permute(0, 2, 1)  # (N, 3000, 1) → (N, 1, 3000)
+            else:
+                self.x_data = self.x_data.squeeze(-1).unsqueeze(1)  # (N, 1, 3000)
 
     def _load_and_process(self, file_list):
         """加载并预处理数据"""
@@ -153,6 +156,12 @@ if __name__ == "__main__":
     # 加载所有数据文件
     data_dir = "E:\\science\\EEG-Sleep-Staging\\data"
     all_files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith('.npz')]
+    test_file = os.path.join(data_dir, "SC4021E0.npz")
+
+    # 测试单个文件加载
+    test_dataset = EnhancedSleepDataset([test_file], mode='test')
+    sample_x, sample_y = test_dataset[0]
+    print(f"Sample shape: {sample_x.shape} | Label: {sample_y}")
 
     # 进行5折划分
     for fold, (train_files, test_files) in enumerate(stratified_kfold_split(all_files)):

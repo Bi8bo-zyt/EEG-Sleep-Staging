@@ -7,14 +7,16 @@ import copy
 from copy import deepcopy
 from einops import rearrange
 
-
 # -------------------- 改进模块1: Depthwise Separable Conv --------------------
 class DepthwiseSeparableConv(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0):
         super().__init__()
-        self.depthwise = nn.Conv1d(in_channels, in_channels, kernel_size=kernel_size,
-                                   stride=stride, padding=padding, groups=in_channels)
-        self.pointwise = nn.Conv1d(in_channels, out_channels, kernel_size=1)
+        self.depthwise = nn.Conv1d(
+            in_channels, in_channels, kernel_size,
+            stride=stride, padding=padding, groups=in_channels
+        )
+        self.padding = (kernel_size - 1) // 2  # 自动计算对称填充
+        self.pointwise = nn.Conv1d(in_channels, out_channels, 1)
         self.bn = nn.BatchNorm1d(out_channels)
         self.act = nn.GELU()
 
@@ -134,14 +136,14 @@ class MRCNN_Improved(nn.Module):
         # 使用深度可分离卷积改进特征提取
         self.features1 = nn.Sequential(
             DepthwiseSeparableConv(1, 64, kernel_size=50, stride=6, padding=24),
-            nn.MaxPool1d(kernel_size=8, stride=2, padding=4),
+            nn.MaxPool1d(kernel_size=8, stride=4, padding=4),  # 修改stride
             nn.Dropout(drate),
 
-            CBAM(64),  # 加入CBAM注意力
+            CBAM(64),
 
             DepthwiseSeparableConv(64, 128, kernel_size=8, padding=4),
             DepthwiseSeparableConv(128, 128, kernel_size=8, padding=4),
-            nn.MaxPool1d(kernel_size=4, stride=4, padding=2)
+            nn.AdaptiveAvgPool1d(100)  # 新增自适应池化
         )
 
         self.features2 = nn.Sequential(
@@ -149,25 +151,37 @@ class MRCNN_Improved(nn.Module):
             nn.MaxPool1d(kernel_size=4, stride=2, padding=2),
             nn.Dropout(drate),
 
-            CBAM(64),  # 加入CBAM注意力
+            CBAM(64),
 
             DepthwiseSeparableConv(64, 128, kernel_size=7, padding=3),
             DepthwiseSeparableConv(128, 128, kernel_size=7, padding=3),
-            nn.MaxPool1d(kernel_size=2, stride=2, padding=1)
+            nn.AdaptiveAvgPool1d(100)  # 新增自适应池化
         )
 
         # 特征金字塔融合
         self.fusion = nn.Sequential(
             DepthwiseSeparableConv(256, afr_reduced_cnn_size, kernel_size=3, padding=1),
             CBAM(afr_reduced_cnn_size),
-            nn.AdaptiveAvgPool1d(100)  # 统一特征长度
+            nn.AdaptiveAvgPool1d(128)  # 统一输出为128点
+        )
+
+        self.dim_validator = nn.Sequential(
+            nn.Conv1d(256, afr_reduced_cnn_size, kernel_size=1),
+            nn.BatchNorm1d(afr_reduced_cnn_size),
+            nn.GELU()
         )
 
     def forward(self, x):
         x1 = self.features1(x)
         x2 = self.features2(x)
-        x_concat = torch.cat((x1, x2), dim=1)
-        return self.fusion(x_concat)
+
+        # 打印中间维度用于调试
+        print(f"Feature1 shape: {x1.shape}, Feature2 shape: {x2.shape}")
+
+        x_concat = torch.cat((x1, x2), dim=1)  # 在通道维度拼接
+        x_concat = self.dim_validator(x_concat)
+
+        return x_concat
 
 
 
@@ -231,28 +245,31 @@ def clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
 
 class LayerNorm(nn.Module):
-    "Construct a layer normalization module."
-
-    def __init__(self, features, eps=1e-6):
-        super(LayerNorm, self).__init__()
-        self.a_2 = nn.Parameter(torch.ones(features))
-        self.b_2 = nn.Parameter(torch.zeros(features))
+    def __init__(self, normalized_shape, eps=1e-6):
+        super().__init__()
+        if isinstance(normalized_shape, int):
+            normalized_shape = (normalized_shape,)
+        self.normalized_shape = normalized_shape
         self.eps = eps
 
+        # 参数需要匹配最后一个维度的尺寸
+        self.a_2 = nn.Parameter(torch.ones(*normalized_shape))
+        self.b_2 = nn.Parameter(torch.zeros(*normalized_shape))
+
     def forward(self, x):
-        mean = x.mean(-1, keepdim=True)
-        std = x.std(-1, keepdim=True)
+        # 确保输入维度匹配
+        input_shape = x.shape
+        assert input_shape[-len(self.normalized_shape):] == self.normalized_shape, \
+            f"LayerNorm维度不匹配: 输入形状{input_shape}，期望最后{len(self.normalized_shape)}维为{self.normalized_shape}"
+
+        mean = x.mean(dim=-1, keepdim=True)
+        std = x.std(dim=-1, keepdim=True, unbiased=False)
         return self.a_2 * (x - mean) / (std + self.eps) + self.b_2
 
+
 class TCE(nn.Module):
-    '''
-    Transformer Encoder
-
-    It is a stack of N layers.
-    '''
-
     def __init__(self, layer, N):
-        super(TCE, self).__init__()
+        super().__init__()
         self.layers = clones(layer, N)
         self.norm = LayerNorm(layer.size)
 
@@ -262,33 +279,39 @@ class TCE(nn.Module):
         return self.norm(x)
 
 class EncoderLayer(nn.Module):
-    '''
-    An encoder layer
-
-    Made up of self-attention and a feed forward layer.
-    Each of these sublayers have residual and layer norm, implemented by SublayerOutput.
-    '''
-    def __init__(self, size, self_attn, feed_forward, afr_reduced_cnn_size, dropout):
-        super(EncoderLayer, self).__init__()
+    def __init__(self, d_model, self_attn, feed_forward, afr_reduced_cnn_size, dropout):
+        super().__init__()
         self.self_attn = self_attn
         self.feed_forward = feed_forward
-        self.sublayer_output = clones(SublayerOutput(size, dropout), 2)
-        self.size = size
-        self.conv = CausalConv1d(afr_reduced_cnn_size, afr_reduced_cnn_size, kernel_size=7, stride=1, dilation=1)
 
+        # 修改LayerNorm初始化方式
+        self.sublayer_output = clones(SublayerOutput(d_model, dropout), 2)
+        self.conv = CausalConv1d(afr_reduced_cnn_size, afr_reduced_cnn_size, kernel_size=7)
+
+        # 添加维度适配器
+        self.dim_adapter = nn.Sequential(
+            nn.Conv1d(afr_reduced_cnn_size, d_model, kernel_size=1),
+            nn.BatchNorm1d(d_model),
+            nn.GELU()
+        ) if afr_reduced_cnn_size != d_model else nn.Identity()
 
     def forward(self, x_in):
-        "Transformer Encoder"
+        # 维度适配
+        x_in = self.dim_adapter(x_in)
+        # 调整维度顺序 [batch, channels, seq] -> [batch, seq, channels]
+        x_in = x_in.permute(0, 2, 1)
+
         query = self.conv(x_in)
-        x = self.sublayer_output[0](query, lambda x: self.self_attn(query, x_in, x_in))  # Encoder self-attention
+        x = self.sublayer_output[0](query, lambda x: self.self_attn(query, x_in, x_in))
+        x = x.permute(0, 2, 1)  # 恢复原始维度
         return self.sublayer_output[1](x, self.feed_forward)
 
 class AttnSleep_Improved(nn.Module):
     def __init__(self):
         super().__init__()
         N = 3  # 增加Transformer层数
-        d_model = 128  # 增大特征维度
-        d_ff = 256
+        d_model = 64  # 增大特征维度
+        d_ff = 128
         h = 8  # 增加注意力头数
         dropout = 0.2
         num_classes = 5
@@ -298,7 +321,8 @@ class AttnSleep_Improved(nn.Module):
 
         attn = MultiHeadedAttention(h, d_model, afr_reduced_cnn_size)
         ff = PositionwiseFeedForward(d_model, d_ff, dropout)
-        self.tce = TCE(EncoderLayer(d_model, deepcopy(attn), deepcopy(ff), afr_reduced_cnn_size, dropout), N)
+        self.tce = TCE(EncoderLayer(d_model, deepcopy(attn), deepcopy(ff),
+                                    afr_reduced_cnn_size, dropout), N)
 
         # 改进分类头：加入多层级感知机
         self.classifier = nn.Sequential(
