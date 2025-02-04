@@ -2,179 +2,177 @@ import os
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
-from sklearn.utils.class_weight import compute_class_weight
+from sklearn.model_selection import KFold
+import random
 
+class SleepDataset(Dataset):
+    def __init__(self, file_list, augment=True):
+        self.augment = augment
+        self.x_data = []
+        self.y_data = []
 
-class EnhancedSleepDataset(Dataset):
-    """支持数据增强和动态标准化的增强型数据集加载器"""
+        print(f"\n🔧 正在加载 {len(file_list)} 个数据文件...")
+        valid_count = 0
 
-    def __init__(self, file_list, mode='train', augment_prob=0.5, noise_scale=0.1):
-        """
-        Args:
-            file_list (list): .npz文件路径列表
-            mode (str): 数据集模式 [train/val/test]
-            augment_prob (float): 数据增强应用概率
-            noise_scale (float): 高斯噪声标准差系数
-        """
-        self.mode = mode
-        self.augment_prob = augment_prob if mode == 'train' else 0.0
-        self.noise_scale = noise_scale
+        for idx, file in enumerate(file_list, 1):
+            try:
+                # 检查文件是否存在
+                if not os.path.exists(file):
+                    print(f"  ⚠️ 文件不存在: {file}")
+                    continue
 
-        # 加载并整合所有数据
-        self.x_data, self.y_data = self._load_and_process(file_list)
+                # 加载数据
+                with np.load(file) as data:
+                    # 检查必要字段
+                    if 'x' not in data or 'y' not in data:
+                        print(f"  ⚠️ 文件格式错误: {file} 缺少x/y字段")
+                        continue
 
-        # 计算全局标准化参数（基于训练集）
-        if mode == 'train':
-            self.mean = np.mean(self.x_data)
-            self.std = np.std(self.x_data)
-        else:
-            self.mean = None
-            self.std = None
+                    x = data['x'].astype(np.float32)
+                    y = data['y'].astype(np.int64)
 
-        # 转换为Tensor
-        self.x_data = torch.FloatTensor(self.x_data)
-        self.y_data = torch.LongTensor(self.y_data)
+                    # 统一维度处理
+                    if x.ndim == 3:
+                        # 情况1: (n, 1, 3000) -> 直接使用
+                        if x.shape[1] == 1 and x.shape[2] == 3000:
+                            pass
+                        # 情况2: (n, 3000, 1) -> 转置为(n, 1, 3000)
+                        elif x.shape[1] == 3000 and x.shape[2] == 1:
+                            x = x.transpose(0, 2, 1)
+                        else:
+                            raise ValueError(f"非常规三维数据: {x.shape}")
+                    # 处理二维数据 (n, 3000) -> (n, 1, 3000)
+                    elif x.ndim == 2:
+                        x = x[:, np.newaxis, :]
+                    else:
+                        raise ValueError(f"不支持的数据维度: {x.ndim}")
 
-        # 新增维度统一处理逻辑
-        if self.x_data.dim() == 2:
-            self.x_data = self.x_data.unsqueeze(1)  # (N, 3000) → (N, 1, 3000)
-        elif self.x_data.dim() == 3:
-            if self.x_data.shape[1] != 1:
-                self.x_data = self.x_data.permute(0, 2, 1)  # (N, 3000, 1) → (N, 1, 3000)
-            else:
-                self.x_data = self.x_data.squeeze(-1).unsqueeze(1)  # (N, 1, 3000)
+                    # 最终形状验证
+                    if x.shape[1:] != (1, 3000):
+                        print(f"  ⚠️ 维度校验失败: {file} 形状={x.shape}")
+                        continue
 
-    def _load_and_process(self, file_list):
-        """加载并预处理数据"""
-        x_list, y_list = [], []
-        for file_path in file_list:
-            with np.load(file_path) as data:
-                x = data['x']
-                y = data['y']
+                    # 转换为Tensor
+                    self.x_data.append(torch.from_numpy(x))
+                    self.y_data.append(torch.from_numpy(y))
+                    valid_count += 1
 
-                # 新增维度调整代码
-                if x.ndim == 3 and x.shape[-1] == 1:
-                    x = x.squeeze(axis=-1)  # 移除冗余的通道维度 (N, 3000, 1) → (N, 3000)
+                    # 进度显示
+                    if idx % 5 == 0:
+                        print(f"  已加载 {idx}/{len(file_list)} 个文件...")
 
-                # 数据清洗（保持原有）
-                valid_idx = ~np.isnan(x).any(axis=1)
-                x = x[valid_idx]
-                y = y[valid_idx]
+            except Exception as e:
+                print(f"  ❌ 加载错误 {file}: {str(e)}")
+                continue
 
-                x_list.append(x)
-                y_list.append(y)
+        # 检查有效数据
+        if valid_count == 0:
+            raise RuntimeError(f"❌ 没有加载到有效数据，请检查文件格式！")
 
-        return np.vstack(x_list), np.concatenate(y_list)
+        # 合并所有数据
+        self.x_data = torch.cat(self.x_data, dim=0)
+        self.y_data = torch.cat(self.y_data, dim=0)
 
-    def _augment(self, x):
-        """应用数据增强"""
-        if torch.rand(1) < self.augment_prob:
-            # 高斯噪声
-            x += torch.randn_like(x) * self.noise_scale * x.std()
+        # 数据标准化
+        self.mean = torch.mean(self.x_data, dim=(0, 2), keepdim=True)
+        self.std = torch.std(self.x_data, dim=(0, 2), keepdim=True)
+        self.x_data = (self.x_data - self.mean) / (self.std + 1e-8)
 
-        if torch.rand(1) < self.augment_prob:
-            # 随机时移
-            shift = torch.randint(-10, 10, (1,)).item()
-            x = torch.roll(x, shifts=shift, dims=1)
-
-        if torch.rand(1) < self.augment_prob:
-            # 随机缩放
-            scale = torch.FloatTensor(1).uniform_(0.8, 1.2)
-            x *= scale
-
-        return x
-
-    def __getitem__(self, idx):
-        x = self.x_data[idx]
-        y = self.y_data[idx]
-
-        # 标准化
-        if self.mean is not None and self.std is not None:
-            x = (x - self.mean) / self.std
-
-        # 数据增强
-        if self.mode == 'train':
-            x = self._augment(x)
-
-        return x, y
+        # 最终维度验证
+        print(f"✅ 成功加载 {len(self)} 个样本")
+        print(f"📐 数据形状: {self.x_data.shape}")
+        assert self.x_data.dim() == 3, f"数据维度错误: 当前维度{self.x_data.dim()}D，应为3D"
+        assert self.x_data.shape[1] == 1, f"通道维度错误: 当前{self.x_data.shape[1]}，应为1"
 
     def __len__(self):
-        return len(self.y_data)
+        return len(self.x_data)
 
-    def get_class_weights(self):
-        """计算类别权重用于损失函数"""
-        y_np = self.y_data.numpy()
-        classes = np.unique(y_np)
-        weights = compute_class_weight('balanced', classes=classes, y=y_np)
-        return torch.FloatTensor(weights)
+    def __getitem__(self, idx):
+        x = self.x_data[idx].clone()
+        y = self.y_data[idx]
 
+        # 数据增强
+        if self.augment:
+            # 随机翻转
+            if random.random() > 0.5:
+                x = torch.flip(x, [-1])
+            # 添加高斯噪声
+            if random.random() > 0.5:
+                x += torch.randn_like(x) * 0.05
 
-def create_data_loaders(train_files, val_files, test_files, batch_size=64,
-                        num_workers=4, augment_prob=0.5):
-    """
-    创建数据加载器三元组
-    Returns:
-        (train_loader, val_loader, test_loader, class_weights)
-    """
-    # 创建数据集
-    train_dataset = EnhancedSleepDataset(train_files, mode='train',
-                                         augment_prob=augment_prob)
-    val_dataset = EnhancedSleepDataset(val_files, mode='val')
-    test_dataset = EnhancedSleepDataset(test_files, mode='test')
-
-    # 获取类别权重
-    class_weights = train_dataset.get_class_weights()
-
-    # 创建DataLoader
-    loader_args = {
-        'batch_size': batch_size,
-        'num_workers': num_workers,
-        'pin_memory': True,
-        'persistent_workers': True
-    }
-
-    train_loader = DataLoader(train_dataset, shuffle=True, **loader_args)
-    val_loader = DataLoader(val_dataset, shuffle=False, **loader_args)
-    test_loader = DataLoader(test_dataset, shuffle=False, **loader_args)
-
-    return train_loader, val_loader, test_loader, class_weights
+        return x.float(), y.long()
 
 
-def stratified_kfold_split(file_list, n_splits=5, seed=42):
-    """分层K折划分（文件级别）"""
-    from sklearn.model_selection import StratifiedKFold
-    # 获取每个文件的标签（取第一个样本的标签）
-    file_labels = [np.load(f)['y'][0] for f in file_list]
+class NestedCVSplitter:
+    def __init__(self, data_dir, n_splits=5, seed=42):
+        # 路径处理
+        self.data_dir = os.path.normpath(data_dir)
+        print(f"\n🔍 正在扫描数据目录: {self.data_dir}")
 
-    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
-    for train_idx, test_idx in skf.split(file_list, file_labels):
-        yield [file_list[i] for i in train_idx], [file_list[i] for i in test_idx]
+        # 获取有效文件列表
+        self.all_files = []
+        for fname in os.listdir(self.data_dir):
+            file_path = os.path.join(self.data_dir, fname)
+            if fname.endswith('.npz') and os.path.isfile(file_path):
+                if os.path.getsize(file_path) > 1024:  # 1KB
+                    self.all_files.append(file_path)
+                else:
+                    print(f"  ⚠️ 忽略空文件: {fname}")
 
+        if not self.all_files:
+            raise FileNotFoundError(f"❌ 目录中没有找到有效的.npz文件: {self.data_dir}")
 
-# 使用示例
-if __name__ == "__main__":
-    # 加载所有数据文件
-    data_dir = "E:\\science\\EEG-Sleep-Staging\\data"
-    all_files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith('.npz')]
-    test_file = os.path.join(data_dir, "SC4021E0.npz")
+        print(f"📂 找到 {len(self.all_files)} 个有效数据文件")
+        self.n_splits = n_splits
+        self.kfold = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
 
-    # 测试单个文件加载
-    test_dataset = EnhancedSleepDataset([test_file], mode='test')
-    sample_x, sample_y = test_dataset[0]
-    print(f"Sample shape: {sample_x.shape} | Label: {sample_y}")
+    def get_fold(self, fold_idx):
+        assert 0 <= fold_idx < self.n_splits, f"无效的fold索引: {fold_idx}"
 
-    # 进行5折划分
-    for fold, (train_files, test_files) in enumerate(stratified_kfold_split(all_files)):
-        print(f"Fold {fold + 1}:")
-        print(f"  Train files: {len(train_files)}")
-        print(f"  Test files: {len(test_files)}")
-
-        # 创建数据加载器
-        train_loader, val_loader, test_loader, class_weights = create_data_loaders(
-            train_files, [], test_files, batch_size=64
+        # 外层划分
+        outer_gen = self.kfold.split(self.all_files)
+        train_val_indices, test_indices = next(
+            (x for i, x in enumerate(outer_gen) if i == fold_idx),
+            (None, None)
         )
 
-        # 验证数据流
-        for x, y in train_loader:
-            print(f"Batch shape: {x.shape}, Labels: {y.shape}")
-            break
+        # 内层划分
+        inner_kfold = KFold(n_splits=self.n_splits - 1, shuffle=True, random_state=fold_idx)
+        inner_splits = []
+
+        for inner_train_idx, inner_val_idx in inner_kfold.split(train_val_indices):
+            # 转换到原始索引
+            real_train = [train_val_indices[i] for i in inner_train_idx]
+            real_val = [train_val_indices[i] for i in inner_val_idx]
+
+            inner_splits.append({
+                'train_files': [self.all_files[i] for i in real_train],
+                'val_files': [self.all_files[i] for i in real_val]
+            })
+
+        return {
+            'test_files': [self.all_files[i] for i in test_indices],
+            'train_val_splits': inner_splits
+        }
+
+
+def create_loaders(train_files, val_files, test_files, batch_size=32):
+    # 训练集带增强
+    train_set = SleepDataset(train_files, augment=True)
+
+    # 验证/测试集不带增强
+    val_set = SleepDataset(val_files, augment=False)
+    test_set = SleepDataset(test_files, augment=False)
+
+    loader_args = {
+        'batch_size': batch_size,
+        'num_workers': 0 if os.name == 'nt' else 4,  # Windows系统禁用多进程
+        'pin_memory': torch.cuda.is_available(),
+        'persistent_workers': False
+    }
+
+    train_loader = DataLoader(train_set, shuffle=True, **loader_args)
+    val_loader = DataLoader(val_set, shuffle=False, **loader_args)
+    test_loader = DataLoader(test_set, shuffle=False, **loader_args)
+
+    return train_loader, val_loader, test_loader

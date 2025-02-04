@@ -1,235 +1,192 @@
-import os
-import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Subset
-from sklearn.model_selection import KFold, StratifiedKFold
-from models.model import AttnSleep_Improved  # 导入你改进后的模型
-from data_loaders import EnhancedSleepDataset
+import numpy as np
 import time
-import json
 import copy
+from itertools import islice
+from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
+from data_loaders import NestedCVSplitter, create_loaders
+from models.model import AttnSleep
 
+# 配置参数
+config = {
+    'data_dir': r'E:/science/EEG-Sleep-Staging/data',
+    'n_outer_folds': 5,
+    'epochs': 100,
+    'batch_size': 64,
+    'patience': 15,
+    'lr': 1e-4,
+    'weight_decay': 1e-4,
+    'device': 'cuda' if torch.cuda.is_available() else 'cpu',
+    'seed': 42
+}
 
-# 实验配置
-class Config:
-    data_path = r"E:\science\EEG-Sleep-Staging\data"  # 数据路径
-    num_classes = 5
-    batch_size = 64
-    epochs = 100
-    lr = 1e-4
-    weight_decay = 1e-4
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    seed = 42
-    save_dir = "./experiments"
-    outer_folds = 5  # 外层交叉验证折数
-    inner_folds = 5  # 内层交叉验证折数
+# 初始化交叉验证
+splitter = NestedCVSplitter(config['data_dir'],
+                            n_splits=config['n_outer_folds'],
+                            seed=config['seed'])
 
+# 存储所有结果
+all_results = []
 
-# 固定随机种子
-def set_seed(seed):
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
+for outer_fold in range(config['n_outer_folds']):
+    print(f"\n=== Processing Outer Fold {outer_fold + 1}/{config['n_outer_folds']} ===")
 
+    # 获取当前fold划分
+    fold_data = splitter.get_fold(outer_fold)
+    test_files = fold_data['test_files']
 
-def load_data_files(data_path):
-    """加载所有npz文件路径"""
-    all_files = []
-    for root, dirs, files in os.walk(data_path):
-        for file in files:
-            if file.endswith(".npz"):
-                all_files.append(os.path.join(root, file))
-    return all_files
+    best_inner_models = []
 
+    # 内层交叉验证
+    for inner_fold, inner_split in enumerate(fold_data['train_val_splits']):
+        print(f"\n--- Inner Fold {inner_fold + 1}/{len(fold_data['train_val_splits'])} ---")
 
-class Trainer:
-    def __init__(self, config, train_files, val_files):
-        self.config = config
-        self.train_dataset = EnhancedSleepDataset(
-            train_files,
-            mode='train',
-            augment_prob=0.5  # 按需调整增强概率
+        # 创建数据加载器
+        train_loader, val_loader, _ = create_loaders(
+            inner_split['train_files'],
+            inner_split['val_files'],
+            test_files,
+            config['batch_size']
         )
-        self.val_dataset = EnhancedSleepDataset(
-            val_files,
-            mode='val'
-        )
 
-        # 计算类别权重
-        all_labels = np.concatenate([self.train_dataset.y_data.numpy()])
-        class_counts = np.bincount(all_labels)
-        class_weights = 1. / class_counts
-        class_weights = torch.tensor(class_weights, dtype=torch.float32).to(config.device)
+        # 初始化模型
+        model = AttnSleep().to(config['device'])
+        optimizer = torch.optim.AdamW(model.parameters(),
+                                      lr=config['lr'],
+                                      weight_decay=config['weight_decay'])
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['epochs'])
+        criterion = nn.CrossEntropyLoss(weight=torch.tensor([1.0, 5.0, 1.0, 1.0, 1.0]).to(config['device']))
 
-        self.model = AttnSleep_Improved().to(config.device)
-        self.criterion = nn.CrossEntropyLoss(weight=class_weights)
+        best_val_loss = float('inf')
+        best_model = None
+        patience_counter = 0
 
-        self.optimizer = torch.optim.AdamW(self.model.parameters(),
-                                           lr=config.lr,
-                                           weight_decay=config.weight_decay)
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=config.epochs)
-
-    def train_epoch(self, train_loader):
-        self.model.train()
-        total_loss = 0.0
-        correct = 0
-
-        for inputs, labels in train_loader:
-            inputs = inputs.to(self.config.device)
-            labels = labels.to(self.config.device)
-
-            self.optimizer.zero_grad()
-            outputs = self.model(inputs)
-            loss = self.criterion(outputs, labels)
-            loss.backward()
-            self.optimizer.step()
-
-            total_loss += loss.item()
-            _, predicted = torch.max(outputs.data, 1)
-            correct += (predicted == labels).sum().item()
-
-        return total_loss / len(train_loader), correct / len(self.train_dataset)
-
-    def evaluate(self, data_loader):
-        self.model.eval()
-        total_loss = 0.0
-        correct = 0
-
-        with torch.no_grad():
-            for inputs, labels in data_loader:
-                inputs = inputs.to(self.config.device)
-                labels = labels.to(self.config.device)
-
-                outputs = self.model(inputs)
-                loss = self.criterion(outputs, labels)
-
-                total_loss += loss.item()
-                _, predicted = torch.max(outputs.data, 1)
-                correct += (predicted == labels).sum().item()
-
-        return total_loss / len(data_loader), correct / len(self.val_dataset)
-
-    def train(self, fold_idx, inner_fold=None):
-        best_val_acc = 0.0
-        early_stop_counter = 0
-
-        train_loader = DataLoader(self.train_dataset,
-                                  batch_size=self.config.batch_size,
-                                  shuffle=True,
-                                  num_workers=4)
-        val_loader = DataLoader(self.val_dataset,
-                                batch_size=self.config.batch_size,
-                                shuffle=False,
-                                num_workers=4)
-
-        history = {
-            "train_loss": [],
-            "train_acc": [],
-            "val_loss": [],
-            "val_acc": []
-        }
-
-        for epoch in range(self.config.epochs):
+        # 训练循环
+        for epoch in range(config['epochs']):
             start_time = time.time()
-            train_loss, train_acc = self.train_epoch(train_loader)
-            val_loss, val_acc = self.evaluate(val_loader)
-            self.scheduler.step()
 
-            history["train_loss"].append(train_loss)
-            history["train_acc"].append(train_acc)
-            history["val_loss"].append(val_loss)
-            history["val_acc"].append(val_acc)
+            # 训练阶段
+            model.train()
+            train_loss = 0
+            for x, y in train_loader:
+                # 输入形状验证
+                assert x.shape[1] == 1, f"Invalid input shape: {x.shape}, expected channel dimension at index 1"
 
-            # 早停机制
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                early_stop_counter = 0
-                # 保存最佳模型
-                model_name = f"fold{fold_idx}_best.pth"
-                if inner_fold is not None:
-                    model_name = f"outer{fold_idx}_inner{inner_fold}_best.pth"
-                torch.save(self.model.state_dict(),
-                           os.path.join(self.config.save_dir, model_name))
+                x = x.to(config['device'], non_blocking=True)
+                y = y.to(config['device'], non_blocking=True)
+
+                optimizer.zero_grad(set_to_none=True)
+                outputs = model(x)
+                loss = criterion(outputs, y)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+
+                train_loss += loss.item() * x.size(0)
+
+            # 验证阶段
+            model.eval()
+            val_loss = 0
+            preds, truths = [], []
+            with torch.no_grad():
+                for x, y in val_loader:
+                    x = x.to(config['device'])
+                    y = y.to(config['device'])
+
+                    outputs = model(x)
+                    loss = criterion(outputs, y)
+
+                    val_loss += loss.item() * x.size(0)
+                    preds.append(torch.argmax(outputs, 1).cpu())
+                    truths.append(y.cpu())
+
+            # 计算指标
+            train_loss /= len(train_loader.dataset)
+            val_loss /= len(val_loader.dataset)
+            preds = torch.cat(preds).numpy()
+            truths = torch.cat(truths).numpy()
+
+            val_acc = accuracy_score(truths, preds)
+            val_f1 = f1_score(truths, preds, average='macro')
+
+            # 学习率调整
+            scheduler.step()
+
+            # 早停检查
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_model = copy.deepcopy(model.state_dict())
+                patience_counter = 0
             else:
-                early_stop_counter += 1
-                if early_stop_counter >= 15:
-                    print(f"Early stopping at epoch {epoch + 1}")
-                    break
+                patience_counter += 1
 
-            print(f"Fold {fold_idx} Epoch {epoch + 1}/{self.config.epochs} | "
-                  f"Time: {time.time() - start_time:.1f}s | "
-                  f"Train Loss: {train_loss:.4f} Acc: {train_acc:.4f} | "
-                  f"Val Loss: {val_loss:.4f} Acc: {val_acc:.4f}")
+            # 打印进度
+            print(f"Epoch {epoch + 1}/{config['epochs']} | "
+                  f"Train Loss: {train_loss:.4f} | "
+                  f"Val Loss: {val_loss:.4f} | "
+                  f"Acc: {val_acc:.4f} | F1: {val_f1:.4f} | "
+                  f"Time: {time.time() - start_time:.2f}s")
 
-        return history, best_val_acc
+            if patience_counter >= config['patience']:
+                print(f"Early stopping at epoch {epoch + 1}")
+                break
 
+        # 保存最佳内层模型
+        best_inner_models.append(best_model)
+        torch.cuda.empty_cache()
 
-def nested_cross_validation(config):
-    set_seed(config.seed)
-    os.makedirs(config.save_dir, exist_ok=True)
+    # 外层测试集评估
+    print("\n--- Testing on Outer Fold ---")
 
-    all_files = load_data_files(config.data_path)
-    file_labels = [np.load(f)["y"][0] for f in all_files]  # 获取每个文件的标签用于分层划分
+    # 创建测试集加载器
+    _, _, test_loader = create_loaders([], [], test_files, config['batch_size'])
 
-    # 外层交叉验证
-    outer_kfold = StratifiedKFold(n_splits=config.outer_folds, shuffle=True, random_state=config.seed)
-    outer_results = []
+    # 模型集成
+    final_preds = []
+    truths = []
+    for model_state in best_inner_models:
+        model.load_state_dict(model_state)
+        model.eval()
 
-    for outer_fold, (outer_train_idx, outer_test_idx) in enumerate(outer_kfold.split(all_files, file_labels)):
-        # 划分外层训练集和测试集
-        outer_train_files = [all_files[i] for i in outer_train_idx]
-        outer_test_files = [all_files[i] for i in outer_test_idx]
+        fold_preds = []
+        with torch.no_grad():
+            for x, y in test_loader:
+                x = x.to(config['device'])
+                outputs = model(x)
+                fold_preds.append(torch.argmax(outputs, 1).cpu().numpy())
+                if len(truths) == 0:
+                    truths.append(y.numpy())
 
-        # 内层交叉验证
-        inner_kfold = StratifiedKFold(n_splits=config.inner_folds, shuffle=True, random_state=config.seed)
-        inner_best_acc = 0.0
-        best_inner_model = None
+        final_preds.append(np.concatenate(fold_preds))
 
-        for inner_fold, (inner_train_idx, inner_val_idx) in enumerate(
-                inner_kfold.split(outer_train_files, [file_labels[i] for i in outer_train_idx])):
+    # 投票集成
+    final_preds = np.stack(final_preds)
+    ensemble_preds = np.apply_along_axis(lambda x: np.bincount(x).argmax(), 0, final_preds)
+    truths = np.concatenate(truths)
 
-            # 划分内层训练集和验证集
-            inner_train_files = [outer_train_files[i] for i in inner_train_idx]
-            inner_val_files = [outer_train_files[i] for i in inner_val_idx]
+    # 计算指标
+    test_acc = accuracy_score(truths, ensemble_preds)
+    test_f1 = f1_score(truths, ensemble_preds, average='macro')
+    cm = confusion_matrix(truths, ensemble_preds)
 
-            # 训练内层模型
-            trainer = Trainer(config, inner_train_files, inner_val_files)
-            history, val_acc = trainer.train(outer_fold, inner_fold)
+    print(f"Outer Fold {outer_fold + 1} Results:")
+    print(f"Accuracy: {test_acc:.4f}")
+    print(f"Macro F1: {test_f1:.4f}")
+    print("Confusion Matrix:")
+    print(cm)
 
-            if val_acc > inner_best_acc:
-                inner_best_acc = val_acc
-                best_inner_model = copy.deepcopy(trainer.model.state_dict())
+    all_results.append({
+        'fold': outer_fold,
+        'accuracy': test_acc,
+        'f1': test_f1,
+        'cm': cm
+    })
 
-        # 使用最佳内层模型初始化外层模型
-        final_model = Trainer(config, outer_train_files, outer_test_files)
-        final_model.model.load_state_dict(best_inner_model)
+# 打印最终结果
+print("\n=== Final Results ===")
+accuracies = [res['accuracy'] for res in all_results]
+f1_scores = [res['f1'] for res in all_results]
 
-        # 在外层测试集上评估
-        test_loader = DataLoader(outer_test_files,
-                                 batch_size=config.batch_size,
-                                 shuffle=False)
-        test_loss, test_acc = final_model.evaluate(test_loader)
-        outer_results.append(test_acc)
-
-        # 保存结果
-        result = {
-            "outer_fold": outer_fold,
-            "test_acc": test_acc,
-            "inner_best_acc": inner_best_acc
-        }
-        with open(os.path.join(config.save_dir, f"result_outer{outer_fold}.json"), "w") as f:
-            json.dump(result, f)
-
-        print(f"Outer Fold {outer_fold} | Test Acc: {test_acc:.4f}")
-
-    # 汇总最终结果
-    print("\nFinal Results:")
-    print(f"Mean Accuracy: {np.mean(outer_results):.4f} ± {np.std(outer_results):.4f}")
-
-
-if __name__ == "__main__":
-    config = Config()
-    nested_cross_validation(config)
+print(f"Average Accuracy: {np.mean(accuracies):.4f} ± {np.std(accuracies):.4f}")
+print(f"Average Macro F1: {np.mean(f1_scores):.4f} ± {np.std(f1_scores):.4f}")
