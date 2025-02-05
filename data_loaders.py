@@ -127,14 +127,17 @@ class NestedCVSplitter:
         self.kfold = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
 
     def get_fold(self, fold_idx):
-        assert 0 <= fold_idx < self.n_splits, f"无效的fold索引: {fold_idx}"
-
         # 外层划分
-        outer_gen = self.kfold.split(self.all_files)
-        train_val_indices, test_indices = next(
-            (x for i, x in enumerate(outer_gen) if i == fold_idx),
-            (None, None)
-        )
+        splits = list(self.kfold.split(self.all_files))
+        if fold_idx >= len(splits):
+            raise ValueError(f"fold索引{fold_idx}超出范围(总fold数{len(splits)})")
+
+        train_val_indices, test_indices = splits[fold_idx]
+
+        # 添加路径验证
+        test_files = [self.all_files[i] for i in test_indices]
+        if not test_files:
+            raise ValueError(f"第{fold_idx + 1}折没有找到测试集文件")
 
         # 内层划分
         inner_kfold = KFold(n_splits=self.n_splits - 1, shuffle=True, random_state=fold_idx)
@@ -157,22 +160,37 @@ class NestedCVSplitter:
 
 
 def create_loaders(train_files, val_files, test_files, batch_size=32):
-    # 训练集带增强
-    train_set = SleepDataset(train_files, augment=True)
+    # 添加空列表检查
+    def check_files(file_list, name):
+        # 允许测试阶段的空列表
+        if not file_list and name != "测试集":
+            raise ValueError(f"{name}文件列表为空！")
+        valid_files = [f for f in file_list if os.path.exists(f)]
+        if not valid_files and name == "测试集":
+            raise ValueError("测试集不能为空")
+        return valid_files
 
-    # 验证/测试集不带增强
-    val_set = SleepDataset(val_files, augment=False)
-    test_set = SleepDataset(test_files, augment=False)
+    # 训练集和验证集允许为空（仅在测试阶段）
+    train_set = None
+    if train_files:
+        train_set = SleepDataset(check_files(train_files, "训练集"), augment=True)
+
+    val_set = None
+    if val_files:
+        val_set = SleepDataset(check_files(val_files, "验证集"), augment=False)
+
+    # 测试集必须存在
+    test_set = SleepDataset(check_files(test_files, "测试集"), augment=False)
 
     loader_args = {
         'batch_size': batch_size,
-        'num_workers': 0 if os.name == 'nt' else 4,  # Windows系统禁用多进程
-        'pin_memory': torch.cuda.is_available(),
-        'persistent_workers': False
+        'num_workers': 4 if os.cpu_count() > 4 else 2,
+        'pin_memory': True,
+        'persistent_workers': True
     }
 
-    train_loader = DataLoader(train_set, shuffle=True, **loader_args)
-    val_loader = DataLoader(val_set, shuffle=False, **loader_args)
-    test_loader = DataLoader(test_set, shuffle=False, **loader_args)
-
-    return train_loader, val_loader, test_loader
+    return (
+        DataLoader(train_set, shuffle=True, **loader_args) if train_set else None,
+        DataLoader(val_set, shuffle=False, **loader_args) if val_set else None,
+        DataLoader(test_set, shuffle=False, **loader_args)
+    )

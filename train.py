@@ -10,9 +10,9 @@ from models.model import AttnSleep
 
 # 配置参数
 config = {
-    'data_dir': r'E:/science/EEG-Sleep-Staging/data',
-    'n_outer_folds': 5,
-    'epochs': 100,
+    'data_dir': r'/home/Wsh/ZYT/Sleep-EDF-20/fpzcz',
+    'n_outer_folds': 3,
+    'epochs': 50,
     'batch_size': 64,
     'patience': 15,
     'lr': 1e-4,
@@ -139,8 +139,17 @@ for outer_fold in range(config['n_outer_folds']):
     # 外层测试集评估
     print("\n--- Testing on Outer Fold ---")
 
-    # 创建测试集加载器
-    _, _, test_loader = create_loaders([], [], test_files, config['batch_size'])
+    # 创建测试集加载器（只传入测试集文件）
+    _, _, test_loader = create_loaders(
+        train_files=None,  # 显式传递None代替空列表
+        val_files=None,
+        test_files=test_files,
+        batch_size=config['batch_size']
+    )
+
+    # 添加空值检查
+    if test_loader is None:
+        raise RuntimeError("测试集加载失败")
 
     # 模型集成
     final_preds = []
