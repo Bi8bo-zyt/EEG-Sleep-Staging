@@ -70,9 +70,38 @@ class DeepSupervisionHead(nn.Module):
 
 
 # ---------------------- 核心模型结构改进 ----------------------
+class TimeFrequencyBlock(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        # 时域分支
+        self.time_branch = nn.Sequential(
+            nn.Conv1d(in_channels, 64, kernel_size=50, stride=6, padding=25),
+            nn.BatchNorm1d(64),
+            nn.GELU()
+        )
+        # 频域分支
+        self.freq_branch = nn.Sequential(
+            nn.Conv1d(in_channels, 64, kernel_size=3, padding=1),
+            nn.BatchNorm1d(64),
+            nn.GELU(),
+            nn.MaxPool1d(2)
+        )
+
+    def forward(self, x):
+        # 时域特征
+        t_feat = self.time_branch(x)
+
+        # 频域转换
+        x_freq = torch.fft.rfft(x, dim=-1).abs()
+        f_feat = self.freq_branch(x_freq)
+
+        # 特征融合
+        return torch.cat([t_feat, f_feat], dim=1)
+
 class MRCNN(nn.Module):
     def __init__(self, afr_reduced_cnn_size):
         super(MRCNN, self).__init__()
+        self.tf_block = TimeFrequencyBlock(in_channels=1)
         drate = 0.5
 
         self.features1 = nn.Sequential(
@@ -151,14 +180,16 @@ class EnhancedTransformer(nn.Module):
     def __init__(self, d_model, nhead, num_layers, afr_size):
         super().__init__()
         self.pos_encoder = RelativePositionalEncoding(d_model)
-        encoder_layer = nn.TransformerEncoderLayer(
+        # 使用更高效的FlashAttention
+        self.encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
-            dim_feedforward=d_model * 4,
-            dropout=0.1,
-            activation='gelu'
+            dim_feedforward=d_model * 2,
+            batch_first=True,
+            activation='gelu',
+            dropout=0.1
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
+        self.transformer = nn.TransformerEncoder(self.encoder_layer, num_layers)
         self.adapt_conv = nn.Conv1d(afr_size, d_model, 1)
 
     def forward(self, x):
@@ -169,10 +200,46 @@ class EnhancedTransformer(nn.Module):
         return x.permute(1, 2, 0)
 
 
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2, reduction='mean'):
+        """
+        多分类Focal Loss
+        参数:
+            alpha (Tensor): 类别权重，shape [num_classes]
+            gamma (float): 调节困难样本权重的指数
+            reduction (str): 损失聚合方式 ('none', 'mean', 'sum')
+        """
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-ce_loss)
+
+        if self.alpha is not None:
+            if self.alpha.device != inputs.device:
+                self.alpha = self.alpha.to(inputs.device)
+            alpha = self.alpha.gather(0, targets)
+            focal_loss = alpha * (1 - pt) ** self.gamma * ce_loss
+        else:
+            focal_loss = (1 - pt) ** self.gamma * ce_loss
+
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
 # ---------------------- 最终模型整合 ----------------------
 class AttnSleep(nn.Module):
     def __init__(self):
         super(AttnSleep, self).__init__()
+        # 增加类别权重
+        self.class_weights = torch.tensor([1.0, 5.0, 1.0, 2.0, 3.0])  # W,N1,N2,N3,REM
+
         afr_size = 30
         d_model = 128
         num_classes = 5
